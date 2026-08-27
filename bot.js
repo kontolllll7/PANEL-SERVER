@@ -34,6 +34,20 @@
 //      Link yang disimpen ke Firebase jadi PERMANEN, gak kedaluwarsa.
 //   3) otomatis nyalain dialog update (maintenance: true) + set updateUrl
 //      ke link permanen itu.
+//
+// ==== NAIKIN LIMIT 20MB -> 2GB (LOCAL BOT API SERVER) ====
+// Kalau APK kamu di atas 20MB (limit resmi server Telegram buat getFile),
+// deploy 1 service TAMBAHAN di Railway (project yang sama) pakai Docker
+// image "aiogram/telegram-bot-api", isi env var TELEGRAM_API_ID &
+// TELEGRAM_API_HASH (daftar sekali di https://my.telegram.org/apps pakai
+// nomor Telegram kamu -- ini CUMA registrasi app, bukan login akun
+// permanen, jadi aman). JANGAN generate domain publik buat service itu,
+// cukup diakses lewat jaringan privat Railway.
+//
+// Abis itu, di service BOT INI (bukan service telegram-bot-api-nya), isi
+// env var TELEGRAM_LOCAL_API_URL = "http://<nama-service-nya>.railway.internal:8081"
+// -- begitu keisi, limit download otomatis naik ke 2GB, gak ada kode lain
+// yang perlu diubah.
 // ============================================================
 const admin = require('firebase-admin');
 const TelegramBot = require('node-telegram-bot-api');
@@ -57,7 +71,33 @@ admin.initializeApp({
 });
 const db = admin.database();
 
-const bot = new TelegramBot(BOT_TOKEN, { polling: true });
+// Limit RESMI dari server Telegram buat method getFile (bukan dari
+// library/bot ini). Telegram ngizinin KIRIM file sampe 50MB ke chat, tapi
+// bot cuma bisa DOWNLOAD BALIK file yang <= 20MB lewat server RESMI mereka
+// -- dua limit yang beda. Begitu pakai Local Bot API Server sendiri
+// (TELEGRAM_LOCAL_API_URL keisi), limit ini naik jadi 2GB.
+const MAX_BOT_DOWNLOAD_BYTES_OFFICIAL = 20 * 1024 * 1024;
+const MAX_BOT_DOWNLOAD_BYTES_LOCAL = 2000 * 1024 * 1024;
+
+// URL server Bot API Telegram yang dipakai. Default kosong = pakai server
+// resmi Telegram (limit download 20MB). Isi TELEGRAM_LOCAL_API_URL di
+// Railway Variables service BOT INI (bukan service telegram-bot-api-nya)
+// kalau udah deploy Local Bot API Server sendiri -- contoh:
+// "http://telegram-bot-api.railway.internal:8081" (ganti "telegram-bot-api"
+// sesuai nama service Docker image yang kamu deploy di Railway). Begitu ini
+// keisi, limit download APK naik dari 20MB jadi sampai 2GB.
+const LOCAL_API_URL = process.env.TELEGRAM_LOCAL_API_URL || null;
+const MAX_BOT_DOWNLOAD_BYTES = LOCAL_API_URL ? MAX_BOT_DOWNLOAD_BYTES_LOCAL : MAX_BOT_DOWNLOAD_BYTES_OFFICIAL;
+
+const bot = new TelegramBot(BOT_TOKEN, {
+    polling: true,
+    ...(LOCAL_API_URL ? { baseApiUrl: LOCAL_API_URL } : {}),
+});
+if (LOCAL_API_URL) {
+    console.log(`📡 Pakai Local Bot API Server: ${LOCAL_API_URL} (limit download naik ke ${(MAX_BOT_DOWNLOAD_BYTES_LOCAL / 1024 / 1024).toFixed(0)}MB)`);
+} else {
+    console.log('📡 Pakai server resmi Telegram (limit download tetap 20MB)');
+}
 console.log('🤖 Bot jalan (polling mode)...');
 
 bot.on('polling_error', (err) => {
@@ -309,11 +349,6 @@ const DOWNLOAD_DIR = path.join(__dirname, 'downloads');
 if (!fs.existsSync(DOWNLOAD_DIR)) fs.mkdirSync(DOWNLOAD_DIR);
 const APK_PATH = path.join(DOWNLOAD_DIR, 'latest.apk');
 
-// Limit RESMI dari server Telegram buat method getFile (bukan dari
-// library/bot ini). Telegram ngizinin KIRIM file sampe 50MB ke chat, tapi
-// bot cuma bisa DOWNLOAD BALIK file yang <= 20MB -- dua limit yang beda.
-const MAX_BOT_DOWNLOAD_BYTES = 20 * 1024 * 1024;
-
 function downloadToFile(url, destPath) {
     return new Promise((resolve, reject) => {
         const file = fs.createWriteStream(destPath);
@@ -379,12 +414,13 @@ async function handleApkUpload(msg) {
     }
 
     if (doc.file_size && doc.file_size > MAX_BOT_DOWNLOAD_BYTES) {
+        const limitMb = (MAX_BOT_DOWNLOAD_BYTES / 1024 / 1024).toFixed(0);
         await bot.sendMessage(
             chatId,
-            `⚠️ File-nya ${(doc.file_size / 1024 / 1024).toFixed(1)}MB -- di atas limit 20MB yang bisa didownload balik lewat Bot API Telegram (ini limit dari Telegram sendiri, bukan dari bot ini; kirim sampe 50MB boleh, tapi ambil-balik-nya beda limit).\n\n` +
-                `Solusinya salah satu:\n` +
-                `1) Upload APK-nya ke hosting lain (Firebase Storage / GitHub Releases), terus kirim linknya pakai /setlink\n` +
-                `2) Atau self-host "Local Bot API Server" (naikin limit sampe 2GB, tapi butuh setup server terpisah)`
+            `⚠️ File-nya ${(doc.file_size / 1024 / 1024).toFixed(1)}MB -- di atas limit ${limitMb}MB yang aktif sekarang.\n\n` +
+                (LOCAL_API_URL
+                    ? `Local Bot API Server udah aktif tapi tetep kelebihan -- coba cek TELEGRAM_BOT_API_MAX_FILE_SIZE di service telegram-bot-api-nya.`
+                    : `Ini limit dari server RESMI Telegram (bot cuma bisa download balik file <= 20MB, walau kirimnya boleh sampe 50MB). Setup Local Bot API Server (isi env var TELEGRAM_LOCAL_API_URL) buat naikin limitnya sampe 2GB, atau upload manual ke hosting lain terus /setlink.`)
         );
         return;
     }
@@ -431,6 +467,58 @@ bot.on('message', async (msg) => {
 
     if (!isAuthorized(chatId)) {
         bot.sendMessage(chatId, `⛔ Kamu gak punya akses. Chat ID kamu: ${chatId}`);
+        return;
+    }
+
+    try {
+        // Kalau user ngetik COMMAND BARU (`/...`), itu artinya dia "keluar"
+        // dari alur nunggu-balesan manapun yang lagi jalan -- batalin
+        // pendingAction-nya duluan sebelum command baru diproses. Ini yang
+        // nutup celah bug lama (state nyangkut kalau user ganti alur).
+        if (text.startsWith('/')) {
+            pendingAction.delete(chatId);
+        } else if (pendingAction.has(chatId)) {
+            // Bukan command -> ini balesan buat alur yang lagi ditunggu.
+            const action = pendingAction.get(chatId);
+            pendingAction.delete(chatId);
+            await runAction(chatId, action, text);
+            return;
+        }
+
+        if (text === '/start' || text === '/menu') {
+            await sendMenu(chatId);
+            return;
+        }
+
+        if (!text.startsWith('/')) {
+            // Bukan command, dan gak ada alur yang lagi ditunggu -> tampilin menu.
+            await sendMenu(chatId);
+            return;
+        }
+
+        const [cmdRaw, ...rest] = text.split(/\s+/);
+        const cmd = cmdRaw.toLowerCase().replace('/', '');
+        const arg = rest.join(' ').trim();
+
+        const knownCommands = ['status', 'on', 'off', 'setlink', 'accounts', 'skipboost', 'unskipboost', 'boostskiplist', 'checkboost'];
+        if (knownCommands.includes(cmd)) {
+            await runAction(chatId, cmd, arg);
+        } else {
+            await bot.sendMessage(chatId, 'Perintah gak dikenal. Ketik /menu buat lihat daftar perintah.');
+        }
+    } catch (err) {
+        console.error(err);
+        bot.sendMessage(chatId, '⚠️ Ada error, cek log Railway.');
+    }
+});
+
+// Handle tap tombol
+bot.on('callback_query', async (query) => {
+    const chatId = query.message.chat.id;
+    const action = query.data;
+
+    if (!isAuthorized(chatId)) {
+        await bot.answerCallbackQuery(query.id, { text: 'Gak punya akses.', show_alert: true });
         return;
     }
 
