@@ -99,6 +99,41 @@ if (LOCAL_API_URL) {
 }
 console.log('🤖 Bot jalan (polling mode)...');
 
+// ============================================================
+// FIX: MENU/BALESAN KE-KIRIM 2X
+//
+// Penyebabnya BUKAN bug di logic command, tapi 2 INSTANCE BOT jalan
+// BERSAMAAN -- biasanya kejadian pas Railway lagi redeploy: container LAMA
+// belum bener-bener mati padahal container BARU udah mulai polling juga,
+// jadi dua-duanya sama-sama nangkep & jawab pesan Telegram yang SAMA
+// (makanya kelihatan 2 balesan dengan versi kode yang beda pas abis update
+// kode -- itu literally instance lama + instance baru jawab bareng).
+//
+// Fix-nya: tiap instance yang start nulis "tanda pengenal" unik ke Firebase
+// (nimpa punya instance sebelumnya). Sebelum bales pesan APAPUN, instance
+// ngecek dulu apa tanda pengenal DIA masih yang paling baru di Firebase --
+// kalau ternyata udah ada instance LEBIH BARU yang nimpa duluan (berarti
+// dia instance lama yang harusnya udah mati), dia DIAM AJA, gak ikut bales.
+// Jadi walau ada 2 instance polling bareng, yang jawab cuma 1 -- instance
+// yang paling baru start.
+// ============================================================
+const INSTANCE_ID = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+db.ref('botInstance')
+    .set({ id: INSTANCE_ID, startedAt: Date.now() })
+    .then(() => console.log(`🔑 Instance ID: ${INSTANCE_ID} (udah diklaim sebagai instance aktif)`))
+    .catch((e) => console.error('Gagal klaim instance:', e.message));
+
+async function isCurrentInstance() {
+    try {
+        const snap = await db.ref('botInstance/id').once('value');
+        return snap.val() === INSTANCE_ID;
+    } catch (e) {
+        // Gagal baca (misal lagi offline sebentar) -- anggap valid aja,
+        // lebih baik sesekali dobel daripada bot diem total gara-gara ini.
+        return true;
+    }
+}
+
 bot.on('polling_error', (err) => {
     console.error('❌ Polling error:', err.message);
 });
@@ -183,9 +218,14 @@ const menuKeyboard = {
 async function sendMenu(chatId) {
     // Ngirim menu baru = user "keluar" dari alur nunggu-balesan manapun.
     pendingAction.delete(chatId);
+    // FIX: teks limit ukuran dulu HARDCODE "maks 20MB" terus-terusan, gak
+    // peduli TELEGRAM_LOCAL_API_URL aktif apa enggak -- padahal begitu
+    // Local Bot API Server aktif, limitnya beneran udah naik ke 2GB.
+    // Sekarang teksnya ngikutin MAX_BOT_DOWNLOAD_BYTES yang sebenarnya aktif.
+    const limitMb = (MAX_BOT_DOWNLOAD_BYTES / 1024 / 1024).toFixed(0);
     await bot.sendMessage(
         chatId,
-        '<b>Panel Admin Blue Games</b>\nPilih menu di bawah, atau kirim file .apk langsung ke sini buat update otomatis (maks 20MB lewat Bot API).',
+        `<b>Panel Admin Blue Games</b>\nPilih menu di bawah, atau kirim file .apk langsung ke sini buat update otomatis (maks ${limitMb}MB).`,
         { parse_mode: 'HTML', ...menuKeyboard }
     );
 }
@@ -477,6 +517,13 @@ async function handleApkUpload(msg) {
 bot.on('message', async (msg) => {
     const chatId = msg.chat.id;
 
+    // Instance lama (dari deployment sebelumnya yang belum bener-bener
+    // mati) -- diem aja, biar gak ikut bales bareng instance yang baru.
+    if (!(await isCurrentInstance())) {
+        console.log('⏭️ Instance ini udah gak aktif (ada instance lebih baru), skip pesan.');
+        return;
+    }
+
     // Kirim file .apk sebagai attachment (bukan command) -> alur khusus.
     if (msg.document) {
         await handleApkUpload(msg);
@@ -538,6 +585,12 @@ bot.on('message', async (msg) => {
 bot.on('callback_query', async (query) => {
     const chatId = query.message.chat.id;
     const action = query.data;
+
+    // Sama kayak di handler message -- instance lama diem aja.
+    if (!(await isCurrentInstance())) {
+        console.log('⏭️ Instance ini udah gak aktif (ada instance lebih baru), skip callback.');
+        return;
+    }
 
     if (!isAuthorized(chatId)) {
         await bot.answerCallbackQuery(query.id, { text: 'Gak punya akses.', show_alert: true });
