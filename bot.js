@@ -18,15 +18,15 @@
 //                               klik "Generate Domain", BIARIN KOSONG --
 //                               bot otomatis pakai domain itu sendiri.
 //
-// ==== FITUR BARU: KIRIM APK LANGSUNG KE BOT ====
+// Env var OPSIONAL (buat naikin limit APK dari 20MB ke 2GB):
+//   TELEGRAM_API_ID          -> daftar sekali di https://my.telegram.org/apps
+//   TELEGRAM_API_HASH        -> (pasangan dari TELEGRAM_API_ID di atas)
+//
+// ==== FITUR: KIRIM APK LANGSUNG KE BOT ====
 // Tinggal kirim file .apk sebagai attachment biasa ke chat ini (BUKAN
 // command, langsung attach file). Bot bakal:
-//   1) cek ukurannya -- Bot API Telegram CUMA BISA download balik file
-//      yang <= 20MB (ini limit dari Telegram sendiri, bukan dari bot ini;
-//      Telegram ngizinin KIRIM file sampe 50MB, tapi limit buat bot
-//      NGAMBIL BALIK filenya beda -- cuma 20MB). Limit ini naik jadi 2GB
-//      kalau TELEGRAM_LOCAL_API_URL udah dipasang (lihat bagian bawah).
-//   2) download APK-nya dari Telegram, TERUS DI-HOST ULANG lewat server
+//   1) cek ukurannya
+//   2) ambil APK-nya dari Telegram, TERUS DI-HOST ULANG lewat server
 //      HTTP kecil yang jalan bareng bot ini (bukan simpen link asli dari
 //      Telegram -- link itu cuma valid ~1 jam, kalau dipakai langsung,
 //      user yang buka app lebih dari 1 jam kemudian bakal gagal download).
@@ -34,20 +34,20 @@
 //   3) otomatis nyalain dialog update (maintenance: true) + set updateUrl
 //      ke link permanen itu.
 //
-// ==== NAIKIN LIMIT 20MB -> 2GB (LOCAL BOT API SERVER) ====
-// Kalau APK kamu di atas 20MB (limit resmi server Telegram buat getFile),
-// deploy 1 service TAMBAHAN di Railway (project yang sama) pakai Docker
-// image "aiogram/telegram-bot-api", isi env var TELEGRAM_API_ID &
-// TELEGRAM_API_HASH (daftar sekali di https://my.telegram.org/apps pakai
-// nomor Telegram kamu -- ini CUMA registrasi app, bukan login akun
-// permanen, jadi aman). JANGAN generate domain publik buat service itu,
-// cukup diakses lewat jaringan privat Railway.
+// ==== NAIKIN LIMIT 20MB -> 2GB (LOCAL BOT API SERVER, SATU CONTAINER) ====
+// PENTING: telegram-bot-api dalam mode --local BALIKIN ABSOLUTE LOCAL PATH
+// di file_path (bukan link HTTP yang bisa didownload dari luar) -- ini
+// bukan bug, emang gitu desainnya (lihat dokumentasi resmi tdlib). Karena
+// itu, telegram-bot-api HARUS jalan di CONTAINER YANG SAMA dengan bot ini
+// (bukan service Railway terpisah), biar bot bisa baca file-nya langsung
+// dari disk yang sama -- ini yang dilakuin kode di bawah (lewat
+// child_process.spawn). Dockerfile khusus juga diperlukan supaya binary
+// telegram-bot-api ikut ke-install di image yang sama dengan Node.js-nya.
 //
-// Abis itu, di service BOT INI (bukan service telegram-bot-api-nya), isi
-// env var TELEGRAM_LOCAL_API_URL = "http://<nama-service-nya>.railway.internal:8081"
-// -- begitu keisi, limit download otomatis naik ke 2GB, gak ada kode lain
-// yang perlu diubah.
+// Kalau TELEGRAM_API_ID & TELEGRAM_API_HASH belum diisi, bot otomatis
+// balik ke server resmi Telegram (limit tetap 20MB, tanpa proses sampingan).
 // ============================================================
+const { spawn } = require('child_process');
 const admin = require('firebase-admin');
 const TelegramBot = require('node-telegram-bot-api');
 const https = require('https');
@@ -63,6 +63,40 @@ if (!BOT_TOKEN) {
     process.exit(1);
 }
 
+// ============================================================
+// NYALAIN telegram-bot-api SEBAGAI PROSES SAMPINGAN
+// (di container yang sama -- lihat penjelasan panjang di atas)
+// ============================================================
+const TBAPI_DIR = '/app/tbapi-data';
+const TBAPI_PORT = 8081;
+let localApiReady = false;
+
+if (process.env.TELEGRAM_API_ID && process.env.TELEGRAM_API_HASH) {
+    if (!fs.existsSync(TBAPI_DIR)) fs.mkdirSync(TBAPI_DIR, { recursive: true });
+
+    const tbapi = spawn('telegram-bot-api', [
+        `--api-id=${process.env.TELEGRAM_API_ID}`,
+        `--api-hash=${process.env.TELEGRAM_API_HASH}`,
+        '--local',
+        `--http-port=${TBAPI_PORT}`,
+        `--dir=${TBAPI_DIR}`,
+    ]);
+
+    tbapi.stdout.on('data', (d) => console.log(`[tbapi] ${d}`.trim()));
+    tbapi.stderr.on('data', (d) => console.log(`[tbapi] ${d}`.trim()));
+    tbapi.on('exit', (code) => {
+        console.error(`⚠️ telegram-bot-api mati (exit code ${code}). Restart container buat nyalain ulang.`);
+    });
+    tbapi.on('error', (err) => {
+        console.error(`⚠️ Gagal jalanin telegram-bot-api: ${err.message}`);
+    });
+
+    localApiReady = true;
+    console.log('🚀 telegram-bot-api dijalanin sebagai proses sampingan (satu container)...');
+} else {
+    console.log('⚠️ TELEGRAM_API_ID / TELEGRAM_API_HASH belum diset -- pakai server resmi Telegram (limit tetap 20MB).');
+}
+
 const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
 admin.initializeApp({
     credential: admin.credential.cert(serviceAccount),
@@ -73,19 +107,15 @@ const db = admin.database();
 // Limit RESMI dari server Telegram buat method getFile (bukan dari
 // library/bot ini). Telegram ngizinin KIRIM file sampe 50MB ke chat, tapi
 // bot cuma bisa DOWNLOAD BALIK file yang <= 20MB lewat server RESMI mereka
-// -- dua limit yang beda. Begitu pakai Local Bot API Server sendiri
-// (TELEGRAM_LOCAL_API_URL keisi), limit ini naik jadi 2GB.
+// -- dua limit yang beda. Begitu local Bot API server nyala, limit ini
+// naik jadi 2GB.
 const MAX_BOT_DOWNLOAD_BYTES_OFFICIAL = 20 * 1024 * 1024;
 const MAX_BOT_DOWNLOAD_BYTES_LOCAL = 2000 * 1024 * 1024;
 
-// URL server Bot API Telegram yang dipakai. Default kosong = pakai server
-// resmi Telegram (limit download 20MB). Isi TELEGRAM_LOCAL_API_URL di
-// Railway Variables service BOT INI (bukan service telegram-bot-api-nya)
-// kalau udah deploy Local Bot API Server sendiri -- contoh:
-// "http://telegram-bot-api.railway.internal:8081" (ganti "telegram-bot-api"
-// sesuai nama service Docker image yang kamu deploy di Railway). Begitu ini
-// keisi, limit download APK naik dari 20MB jadi sampai 2GB.
-const LOCAL_API_URL = process.env.TELEGRAM_LOCAL_API_URL || null;
+// Kalau proses sampingan telegram-bot-api berhasil dinyalain, bot connect
+// ke situ (lewat localhost, sesama proses di container yang sama) buat
+// naikin limit download APK dari 20MB ke 2GB.
+const LOCAL_API_URL = localApiReady ? `http://localhost:${TBAPI_PORT}` : null;
 const MAX_BOT_DOWNLOAD_BYTES = LOCAL_API_URL ? MAX_BOT_DOWNLOAD_BYTES_LOCAL : MAX_BOT_DOWNLOAD_BYTES_OFFICIAL;
 
 const bot = new TelegramBot(BOT_TOKEN, {
@@ -218,10 +248,6 @@ const menuKeyboard = {
 async function sendMenu(chatId) {
     // Ngirim menu baru = user "keluar" dari alur nunggu-balesan manapun.
     pendingAction.delete(chatId);
-    // FIX: teks limit ukuran dulu HARDCODE "maks 20MB" terus-terusan, gak
-    // peduli TELEGRAM_LOCAL_API_URL aktif apa enggak -- padahal begitu
-    // Local Bot API Server aktif, limitnya beneran udah naik ke 2GB.
-    // Sekarang teksnya ngikutin MAX_BOT_DOWNLOAD_BYTES yang sebenarnya aktif.
     const limitMb = (MAX_BOT_DOWNLOAD_BYTES / 1024 / 1024).toFixed(0);
     await bot.sendMessage(
         chatId,
@@ -275,9 +301,6 @@ async function runAction(chatId, action, arg) {
             { parse_mode: 'HTML' }
         );
     } else if (action === 'update') {
-        // Info detail soal APK yang lagi ke-set sebagai update aktif --
-        // fileName/fileSize/uploadedAt kesimpen otomatis pas APK dikirim
-        // langsung ke bot (handleApkUpload).
         const updateSnap = await ref.child('updateStatus').once('value');
         const status = updateSnap.val() || { maintenance: false, updateUrl: '' };
 
@@ -338,9 +361,6 @@ async function runAction(chatId, action, arg) {
             return;
         }
         await ref.child(`boostSkip/${id}`).set(true);
-        // Baca lagi langsung abis nulis, biar konfirmasi ke admin BENERAN
-        // nyocok sama apa yang beneran kesimpen di database (bukan cuma
-        // asumsi write-nya sukses).
         const verifySnap = await ref.child(`boostSkip/${id}`).once('value');
         if (verifySnap.val() === true) {
             await bot.sendMessage(chatId, `✅ Dialog boost (hitung mundur 15 detik) di-SKIP buat ID ${formatId(id)}.\n\nCatatan: di app-nya baru ke-apply dalam ±15 detik (auto-refresh) atau begitu app dibuka lagi.`);
@@ -376,8 +396,6 @@ async function runAction(chatId, action, arg) {
             });
         }
     } else if (action === 'checkboost') {
-        // Command debug: baca LANGSUNG dari database, apa adanya, gak lewat
-        // cache/logic apapun -- buat mastiin data yang beneran kesimpen.
         if (!arg) {
             await bot.sendMessage(chatId, 'Kirim: /checkboost <id>\nContoh: /checkboost 1');
             return;
@@ -398,18 +416,16 @@ async function runAction(chatId, action, arg) {
     }
 }
 
-// ============================================================
-// FITUR KIRIM APK LANGSUNG KE BOT
-// ============================================================
 const DOWNLOAD_DIR = path.join(__dirname, 'downloads');
 if (!fs.existsSync(DOWNLOAD_DIR)) fs.mkdirSync(DOWNLOAD_DIR);
 const APK_PATH = path.join(DOWNLOAD_DIR, 'latest.apk');
 
+// Dipakai kalau LOCAL_API_URL gak aktif (server resmi Telegram) --
+// download lewat HTTPS biasa dari link file resmi Telegram.
 function downloadToFile(url, destPath) {
     return new Promise((resolve, reject) => {
-        const client = url.startsWith('https://') ? https : http;
         const file = fs.createWriteStream(destPath);
-        client
+        https
             .get(url, (res) => {
                 if (res.statusCode !== 200) {
                     file.close();
@@ -476,8 +492,8 @@ async function handleApkUpload(msg) {
             chatId,
             `⚠️ File-nya ${(doc.file_size / 1024 / 1024).toFixed(1)}MB -- di atas limit ${limitMb}MB yang aktif sekarang.\n\n` +
                 (LOCAL_API_URL
-                    ? `Local Bot API Server udah aktif tapi tetep kelebihan -- coba cek TELEGRAM_BOT_API_MAX_FILE_SIZE di service telegram-bot-api-nya.`
-                    : `Ini limit dari server RESMI Telegram (bot cuma bisa download balik file <= 20MB, walau kirimnya boleh sampe 50MB). Setup Local Bot API Server (isi env var TELEGRAM_LOCAL_API_URL) buat naikin limitnya sampe 2GB.`)
+                    ? `Local Bot API Server udah aktif tapi tetep kelebihan -- ukuran ini beneran di luar batas 2GB.`
+                    : `Ini limit dari server RESMI Telegram (bot cuma bisa download balik file <= 20MB, walau kirimnya boleh sampe 50MB). Set env var TELEGRAM_API_ID & TELEGRAM_API_HASH buat naikin limitnya sampe 2GB.`)
         );
         return;
     }
@@ -493,8 +509,21 @@ async function handleApkUpload(msg) {
 
     try {
         await bot.sendMessage(chatId, `⏳ Mengunduh ${fileName} (${(doc.file_size / 1024 / 1024).toFixed(1)}MB) dari Telegram...`);
-        const fileLink = await bot.getFileLink(doc.file_id);
-        await downloadToFile(fileLink, APK_PATH);
+
+        if (LOCAL_API_URL) {
+            // Mode local (satu container dengan telegram-bot-api): file_path
+            // dari getFile udah berupa ABSOLUTE PATH DI DISK CONTAINER INI
+            // SENDIRI -- tinggal di-copy langsung, gak perlu request HTTP lagi
+            // (itu emang gak didukung lagi di mode --local, lihat komentar
+            // panjang di bagian atas file ini).
+            const file = await bot.getFile(doc.file_id);
+            await fs.promises.copyFile(file.file_path, APK_PATH);
+        } else {
+            // Mode server resmi Telegram: file_path masih berupa path relatif
+            // yang perlu diubah jadi link HTTPS buat didownload.
+            const fileLink = await bot.getFileLink(doc.file_id);
+            await downloadToFile(fileLink, APK_PATH);
+        }
 
         const publicUrl = `${publicBase}/latest.apk`;
         await db.ref('updateStatus').set({
