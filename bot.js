@@ -31,8 +31,13 @@
 //      Telegram -- link itu cuma valid ~1 jam, kalau dipakai langsung,
 //      user yang buka app lebih dari 1 jam kemudian bakal gagal download).
 //      Link yang disimpen ke Firebase jadi PERMANEN, gak kedaluwarsa.
-//   3) otomatis nyalain dialog update (maintenance: true) + set updateUrl
-//      ke link permanen itu.
+//   3) BACA LANGSUNG versionCode dari file APK-nya sendiri (pake
+//      app-info-parser, TANPA admin perlu ketik angka apapun) --
+//      ini yang dipake app buat nentuin apa update ini beneran lebih
+//      baru dari yang lagi kepasang di HP user, jadi update gak
+//      ke-trigger berulang walau link-nya statis/sama terus.
+//   4) otomatis nyalain dialog update (maintenance: true) + set updateUrl
+//      ke link permanen itu + latestVersionCode hasil baca otomatis tadi.
 //
 // ==== NAIKIN LIMIT 20MB -> 2GB (LOCAL BOT API SERVER, SATU CONTAINER) ====
 // PENTING: telegram-bot-api dalam mode --local BALIKIN ABSOLUTE LOCAL PATH
@@ -50,6 +55,7 @@
 const { spawn } = require('child_process');
 const admin = require('firebase-admin');
 const TelegramBot = require('node-telegram-bot-api');
+const AppInfoParser = require('app-info-parser');
 const https = require('https');
 const http = require('http');
 const fs = require('fs');
@@ -317,6 +323,7 @@ async function runAction(chatId, action, arg) {
             `<b>Update Aktif Sekarang</b>\n\n` +
                 `Nama file: ${status.fileName || '(gak ada nama)'}\n` +
                 `Ukuran: ${sizeLine}\n` +
+                `versionCode: ${status.latestVersionCode || '(gak diketahui)'}\n` +
                 `Diupload: ${uploadedLine}\n` +
                 `Dialog update: ${status.maintenance ? 'AKTIF (bakal ke-download otomatis di app user)' : 'MATI (APK ini nganggur, gak dikirim ke user manapun)'}\n\n` +
                 `Link: ${status.updateUrl}`,
@@ -456,6 +463,12 @@ function getPublicBaseUrl() {
 // STABIL & GAK KEDALUWARSA -- beda sama link file:// bawaan Telegram yang
 // cuma valid ~1 jam. User bisa buka app-nya kapan aja (bahkan berhari-hari
 // setelah admin kirim APK-nya ke bot), link ini tetap kepake.
+//
+// CATATAN: link ini SENGAJA statis ("/latest.apk") -- filenya yang ditimpa
+// tiap ada update baru, bukan linknya yang berubah. Makanya app di sisi
+// Android JANGAN pake link ini buat nentuin "ada update baru apa enggak"
+// (linknya emang selalu sama) -- app harus bandingin `latestVersionCode`
+// (dibaca otomatis di bawah) sama versionCode yang lagi kepasang.
 const PORT = process.env.PORT || 3000;
 http
     .createServer((req, res) => {
@@ -471,6 +484,32 @@ http
         }
     })
     .listen(PORT, () => console.log(`🌐 Static server APK jalan di port ${PORT}`));
+
+// ============================================================
+// BACA versionCode LANGSUNG DARI FILE APK -- admin GAK PERLU KETIK
+// ANGKA APAPUN. Ini yang bikin seluruh alur update jadi 100% otomatis:
+// admin cuma kirim file .apk ke chat, sisanya (hosting + baca versi +
+// tulis ke Firebase) semua kejadian sendiri di sini.
+// ============================================================
+function readApkVersionCode(apkPath) {
+    return new Promise((resolve, reject) => {
+        const parser = new AppInfoParser(apkPath);
+        parser
+            .parse()
+            .then((result) => {
+                // app-info-parser balikin versionCode sebagai string/number
+                // tergantung versi APK -- dipaksa jadi Number biar konsisten
+                // dibandingin sama versionCode di app Android (Long).
+                const versionCode = Number(result.versionCode);
+                if (!versionCode || Number.isNaN(versionCode)) {
+                    reject(new Error('versionCode gak kebaca dari APK (hasil parse kosong/invalid)'));
+                    return;
+                }
+                resolve({ versionCode, versionName: result.versionName || null });
+            })
+            .catch(reject);
+    });
+}
 
 async function handleApkUpload(msg) {
     const chatId = msg.chat.id;
@@ -525,10 +564,31 @@ async function handleApkUpload(msg) {
             await downloadToFile(fileLink, APK_PATH);
         }
 
+        // Baca versionCode langsung dari file APK yang baru kedownload --
+        // GAGAL DI SINI = STOP, jangan lanjut nulis ke Firebase sama sekali.
+        // Lebih aman APK lama tetap aktif daripada nulis data update yang
+        // versionCode-nya gak jelas (bisa bikin app user gak pernah keupdate
+        // ATAU malah gak mau install sama sekali).
+        let versionInfo;
+        try {
+            versionInfo = await readApkVersionCode(APK_PATH);
+        } catch (err) {
+            console.error('Gagal baca versionCode APK:', err);
+            await bot.sendMessage(
+                chatId,
+                `⚠️ File udah kedownload tapi GAGAL baca versionCode-nya (${err.message}).\n` +
+                    `Firebase TIDAK diupdate -- update yang lagi aktif sekarang (kalau ada) tetap dipakai. ` +
+                    `Cek lagi APK-nya, mungkin corrupt atau bukan APK valid.`
+            );
+            return;
+        }
+
         const publicUrl = `${publicBase}/latest.apk`;
         await db.ref('updateStatus').set({
             maintenance: true,
             updateUrl: publicUrl,
+            latestVersionCode: versionInfo.versionCode,
+            latestVersionName: versionInfo.versionName,
             fileName,
             fileSize: doc.file_size || 0,
             uploadedAt: Date.now(),
@@ -536,7 +596,10 @@ async function handleApkUpload(msg) {
 
         await bot.sendMessage(
             chatId,
-            `✅ APK diterima & disimpan di server.\nDialog update AKTIF, link permanen (gak kedaluwarsa, valid buat semua user kapan aja mereka buka app):\n${publicUrl}`
+            `✅ APK diterima & disimpan di server.\n` +
+                `versionCode terdeteksi: ${versionInfo.versionCode}` +
+                (versionInfo.versionName ? ` (v${versionInfo.versionName})` : '') +
+                `\nDialog update AKTIF, link permanen:\n${publicUrl}`
         );
     } catch (err) {
         console.error(err);
@@ -638,3 +701,4 @@ bot.on('callback_query', async (query) => {
         await bot.answerCallbackQuery(query.id, { text: 'Error, cek log Railway.', show_alert: true });
     }
 });
+     
