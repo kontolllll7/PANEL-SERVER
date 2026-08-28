@@ -407,8 +407,9 @@ const APK_PATH = path.join(DOWNLOAD_DIR, 'latest.apk');
 
 function downloadToFile(url, destPath) {
     return new Promise((resolve, reject) => {
+        const client = url.startsWith('https://') ? https : http;
         const file = fs.createWriteStream(destPath);
-        https
+        client
             .get(url, (res) => {
                 if (res.statusCode !== 200) {
                     file.close();
