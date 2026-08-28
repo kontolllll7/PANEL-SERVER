@@ -24,9 +24,8 @@
 //   1) cek ukurannya -- Bot API Telegram CUMA BISA download balik file
 //      yang <= 20MB (ini limit dari Telegram sendiri, bukan dari bot ini;
 //      Telegram ngizinin KIRIM file sampe 50MB, tapi limit buat bot
-//      NGAMBIL BALIK filenya beda -- cuma 20MB). Kalau APK kamu lebih
-//      gede dari itu, bot bakal kasih tau dan kamu perlu pakai /setlink
-//      manual (upload ke Firebase Storage/GitHub Releases dulu).
+//      NGAMBIL BALIK filenya beda -- cuma 20MB). Limit ini naik jadi 2GB
+//      kalau TELEGRAM_LOCAL_API_URL udah dipasang (lihat bagian bawah).
 //   2) download APK-nya dari Telegram, TERUS DI-HOST ULANG lewat server
 //      HTTP kecil yang jalan bareng bot ini (bukan simpen link asli dari
 //      Telegram -- link itu cuma valid ~1 jam, kalau dipakai langsung,
@@ -108,9 +107,9 @@ bot.on('polling_error', (err) => {
 bot.setMyCommands([
     { command: 'menu', description: 'Lihat semua perintah' },
     { command: 'status', description: 'Lihat status dialog update & statistik akun' },
+    { command: 'update', description: 'Lihat info APK update yang lagi aktif' },
     { command: 'on', description: 'Aktifkan dialog update' },
     { command: 'off', description: 'Matikan dialog update' },
-    { command: 'setlink', description: 'Ganti link update manual' },
     { command: 'accounts', description: 'Lihat daftar akun + terakhir aktif' },
     { command: 'skipboost', description: 'Skip dialog boost 15 detik buat 1 ID' },
     { command: 'unskipboost', description: 'Balikin dialog boost buat 1 ID' },
@@ -160,17 +159,17 @@ function formatRelativeTime(ts) {
 // dan otomatis kehapus begitu user ngirim command APAPUN (`/...`).
 // Jadi gak mungkin ada 2 state nyangkut bareng lagi.
 // ============================================================
-const pendingAction = new Map(); // chatId -> 'setlink' | 'skipboost' | 'unskipboost'
+const pendingAction = new Map(); // chatId -> 'skipboost' | 'unskipboost'
 
 const menuKeyboard = {
     reply_markup: {
         inline_keyboard: [
             [{ text: '📊 Status', callback_data: 'status' }],
+            [{ text: '🆕 Info Update Terakhir', callback_data: 'update' }],
             [
                 { text: '✅ Aktifkan Dialog', callback_data: 'on' },
                 { text: '⛔ Matikan Dialog', callback_data: 'off' },
             ],
-            [{ text: '🔗 Ganti Link Update', callback_data: 'setlink' }],
             [{ text: '📋 Lihat Daftar Akun', callback_data: 'accounts' }],
             [
                 { text: '🚀 Skip Boost (ID)', callback_data: 'skipboost' },
@@ -235,20 +234,37 @@ async function runAction(chatId, action, arg) {
                 `Link update: ${status.updateUrl || '(belum di-set)'}`,
             { parse_mode: 'HTML' }
         );
+    } else if (action === 'update') {
+        // Info detail soal APK yang lagi ke-set sebagai update aktif --
+        // fileName/fileSize/uploadedAt kesimpen otomatis pas APK dikirim
+        // langsung ke bot (handleApkUpload).
+        const updateSnap = await ref.child('updateStatus').once('value');
+        const status = updateSnap.val() || { maintenance: false, updateUrl: '' };
+
+        if (!status.updateUrl) {
+            await bot.sendMessage(chatId, '(belum ada update yang di-set. Kirim file .apk langsung ke chat ini)');
+            return;
+        }
+
+        const sizeLine = status.fileSize ? `${(status.fileSize / 1024 / 1024).toFixed(1)}MB` : '(gak diketahui)';
+        const uploadedLine = status.uploadedAt ? formatRelativeTime(status.uploadedAt) : '(gak diketahui)';
+
+        await bot.sendMessage(
+            chatId,
+            `<b>Update Aktif Sekarang</b>\n\n` +
+                `Nama file: ${status.fileName || '(gak ada nama)'}\n` +
+                `Ukuran: ${sizeLine}\n` +
+                `Diupload: ${uploadedLine}\n` +
+                `Dialog update: ${status.maintenance ? 'AKTIF (bakal ke-download otomatis di app user)' : 'MATI (APK ini nganggur, gak dikirim ke user manapun)'}\n\n` +
+                `Link: ${status.updateUrl}`,
+            { parse_mode: 'HTML' }
+        );
     } else if (action === 'on') {
         await ref.child('updateStatus/maintenance').set(true);
         await bot.sendMessage(chatId, '✅ Dialog update sekarang AKTIF di aplikasi.');
     } else if (action === 'off') {
         await ref.child('updateStatus/maintenance').set(false);
         await bot.sendMessage(chatId, '✅ Dialog update sekarang DIMATIKAN.');
-    } else if (action === 'setlink') {
-        if (!arg) {
-            pendingAction.set(chatId, 'setlink');
-            await bot.sendMessage(chatId, 'Kirim link update yang baru (langsung ketik & send):');
-        } else {
-            await ref.child('updateStatus/updateUrl').set(arg);
-            await bot.sendMessage(chatId, `✅ Link update disimpan: ${arg}`);
-        }
     } else if (action === 'accounts') {
         const [accountsSnap, lastActiveSnap] = await Promise.all([
             ref.child('accounts').once('value'),
@@ -420,7 +436,7 @@ async function handleApkUpload(msg) {
             `⚠️ File-nya ${(doc.file_size / 1024 / 1024).toFixed(1)}MB -- di atas limit ${limitMb}MB yang aktif sekarang.\n\n` +
                 (LOCAL_API_URL
                     ? `Local Bot API Server udah aktif tapi tetep kelebihan -- coba cek TELEGRAM_BOT_API_MAX_FILE_SIZE di service telegram-bot-api-nya.`
-                    : `Ini limit dari server RESMI Telegram (bot cuma bisa download balik file <= 20MB, walau kirimnya boleh sampe 50MB). Setup Local Bot API Server (isi env var TELEGRAM_LOCAL_API_URL) buat naikin limitnya sampe 2GB, atau upload manual ke hosting lain terus /setlink.`)
+                    : `Ini limit dari server RESMI Telegram (bot cuma bisa download balik file <= 20MB, walau kirimnya boleh sampe 50MB). Setup Local Bot API Server (isi env var TELEGRAM_LOCAL_API_URL) buat naikin limitnya sampe 2GB.`)
         );
         return;
     }
@@ -440,7 +456,13 @@ async function handleApkUpload(msg) {
         await downloadToFile(fileLink, APK_PATH);
 
         const publicUrl = `${publicBase}/latest.apk`;
-        await db.ref('updateStatus').set({ maintenance: true, updateUrl: publicUrl });
+        await db.ref('updateStatus').set({
+            maintenance: true,
+            updateUrl: publicUrl,
+            fileName,
+            fileSize: doc.file_size || 0,
+            uploadedAt: Date.now(),
+        });
 
         await bot.sendMessage(
             chatId,
@@ -500,7 +522,7 @@ bot.on('message', async (msg) => {
         const cmd = cmdRaw.toLowerCase().replace('/', '');
         const arg = rest.join(' ').trim();
 
-        const knownCommands = ['status', 'on', 'off', 'setlink', 'accounts', 'skipboost', 'unskipboost', 'boostskiplist', 'checkboost'];
+        const knownCommands = ['status', 'update', 'on', 'off', 'accounts', 'skipboost', 'unskipboost', 'boostskiplist', 'checkboost'];
         if (knownCommands.includes(cmd)) {
             await runAction(chatId, cmd, arg);
         } else {
