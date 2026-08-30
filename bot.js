@@ -11,55 +11,13 @@
 //   FIREBASE_SERVICE_ACCOUNT -> isi serviceAccountKey.json, di-JSON.stringify jadi satu baris
 //   FIREBASE_DATABASE_URL    -> https://daftar-id-default-rtdb.asia-southeast1.firebasedatabase.app
 //
-// Env var OPSIONAL (buat fitur kirim APK langsung ke bot):
-//   PUBLIC_BASE_URL          -> cuma perlu diisi manual KALAU Railway belum
-//                               auto-generate domain publik. Kalau di tab
-//                               Settings > Networking service ini kamu udah
-//                               klik "Generate Domain", BIARIN KOSONG --
-//                               bot otomatis pakai domain itu sendiri.
-//
-// Env var OPSIONAL (buat naikin limit APK dari 20MB ke 2GB):
-//   TELEGRAM_API_ID          -> daftar sekali di https://my.telegram.org/apps
-//   TELEGRAM_API_HASH        -> (pasangan dari TELEGRAM_API_ID di atas)
-//
-// ==== FITUR: KIRIM APK LANGSUNG KE BOT ====
-// Tinggal kirim file .apk sebagai attachment biasa ke chat ini (BUKAN
-// command, langsung attach file). Bot bakal:
-//   1) cek ukurannya
-//   2) ambil APK-nya dari Telegram, TERUS DI-HOST ULANG lewat server
-//      HTTP kecil yang jalan bareng bot ini (bukan simpen link asli dari
-//      Telegram -- link itu cuma valid ~1 jam, kalau dipakai langsung,
-//      user yang buka app lebih dari 1 jam kemudian bakal gagal download).
-//      Link yang disimpen ke Firebase jadi PERMANEN, gak kedaluwarsa.
-//   3) BACA LANGSUNG versionCode dari file APK-nya sendiri (pake
-//      app-info-parser, TANPA admin perlu ketik angka apapun) --
-//      ini yang dipake app buat nentuin apa update ini beneran lebih
-//      baru dari yang lagi kepasang di HP user, jadi update gak
-//      ke-trigger berulang walau link-nya statis/sama terus.
-//   4) otomatis nyalain dialog update (maintenance: true) + set updateUrl
-//      ke link permanen itu + latestVersionCode hasil baca otomatis tadi.
-//
-// ==== NAIKIN LIMIT 20MB -> 2GB (LOCAL BOT API SERVER, SATU CONTAINER) ====
-// PENTING: telegram-bot-api dalam mode --local BALIKIN ABSOLUTE LOCAL PATH
-// di file_path (bukan link HTTP yang bisa didownload dari luar) -- ini
-// bukan bug, emang gitu desainnya (lihat dokumentasi resmi tdlib). Karena
-// itu, telegram-bot-api HARUS jalan di CONTAINER YANG SAMA dengan bot ini
-// (bukan service Railway terpisah), biar bot bisa baca file-nya langsung
-// dari disk yang sama -- ini yang dilakuin kode di bawah (lewat
-// child_process.spawn). Dockerfile khusus juga diperlukan supaya binary
-// telegram-bot-api ikut ke-install di image yang sama dengan Node.js-nya.
-//
-// Kalau TELEGRAM_API_ID & TELEGRAM_API_HASH belum diisi, bot otomatis
-// balik ke server resmi Telegram (limit tetap 20MB, tanpa proses sampingan).
+// CATATAN: fitur update APK jarak jauh (kirim .apk ke bot, local bot-api
+// server, dialog update di app) udah DIHAPUS karena sering error. Bot ini
+// sekarang cuma ngurus: skip/unskip boost, daftar akun, dan info user
+// terakhir aktif.
 // ============================================================
-const { spawn } = require('child_process');
 const admin = require('firebase-admin');
 const TelegramBot = require('node-telegram-bot-api');
-const AppInfoParser = require('app-info-parser');
-const https = require('https');
-const http = require('http');
-const fs = require('fs');
-const path = require('path');
 
 const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const ADMIN_CHAT_ID = process.env.TELEGRAM_ADMIN_CHAT_ID || '';
@@ -69,40 +27,6 @@ if (!BOT_TOKEN) {
     process.exit(1);
 }
 
-// ============================================================
-// NYALAIN telegram-bot-api SEBAGAI PROSES SAMPINGAN
-// (di container yang sama -- lihat penjelasan panjang di atas)
-// ============================================================
-const TBAPI_DIR = '/app/tbapi-data';
-const TBAPI_PORT = 8081;
-let localApiReady = false;
-
-if (process.env.TELEGRAM_API_ID && process.env.TELEGRAM_API_HASH) {
-    if (!fs.existsSync(TBAPI_DIR)) fs.mkdirSync(TBAPI_DIR, { recursive: true });
-
-    const tbapi = spawn('telegram-bot-api', [
-        `--api-id=${process.env.TELEGRAM_API_ID}`,
-        `--api-hash=${process.env.TELEGRAM_API_HASH}`,
-        '--local',
-        `--http-port=${TBAPI_PORT}`,
-        `--dir=${TBAPI_DIR}`,
-    ]);
-
-    tbapi.stdout.on('data', (d) => console.log(`[tbapi] ${d}`.trim()));
-    tbapi.stderr.on('data', (d) => console.log(`[tbapi] ${d}`.trim()));
-    tbapi.on('exit', (code) => {
-        console.error(`⚠️ telegram-bot-api mati (exit code ${code}). Restart container buat nyalain ulang.`);
-    });
-    tbapi.on('error', (err) => {
-        console.error(`⚠️ Gagal jalanin telegram-bot-api: ${err.message}`);
-    });
-
-    localApiReady = true;
-    console.log('🚀 telegram-bot-api dijalanin sebagai proses sampingan (satu container)...');
-} else {
-    console.log('⚠️ TELEGRAM_API_ID / TELEGRAM_API_HASH belum diset -- pakai server resmi Telegram (limit tetap 20MB).');
-}
-
 const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
 admin.initializeApp({
     credential: admin.credential.cert(serviceAccount),
@@ -110,29 +34,7 @@ admin.initializeApp({
 });
 const db = admin.database();
 
-// Limit RESMI dari server Telegram buat method getFile (bukan dari
-// library/bot ini). Telegram ngizinin KIRIM file sampe 50MB ke chat, tapi
-// bot cuma bisa DOWNLOAD BALIK file yang <= 20MB lewat server RESMI mereka
-// -- dua limit yang beda. Begitu local Bot API server nyala, limit ini
-// naik jadi 2GB.
-const MAX_BOT_DOWNLOAD_BYTES_OFFICIAL = 20 * 1024 * 1024;
-const MAX_BOT_DOWNLOAD_BYTES_LOCAL = 2000 * 1024 * 1024;
-
-// Kalau proses sampingan telegram-bot-api berhasil dinyalain, bot connect
-// ke situ (lewat localhost, sesama proses di container yang sama) buat
-// naikin limit download APK dari 20MB ke 2GB.
-const LOCAL_API_URL = localApiReady ? `http://localhost:${TBAPI_PORT}` : null;
-const MAX_BOT_DOWNLOAD_BYTES = LOCAL_API_URL ? MAX_BOT_DOWNLOAD_BYTES_LOCAL : MAX_BOT_DOWNLOAD_BYTES_OFFICIAL;
-
-const bot = new TelegramBot(BOT_TOKEN, {
-    polling: true,
-    ...(LOCAL_API_URL ? { baseApiUrl: LOCAL_API_URL } : {}),
-});
-if (LOCAL_API_URL) {
-    console.log(`📡 Pakai Local Bot API Server: ${LOCAL_API_URL} (limit download naik ke ${(MAX_BOT_DOWNLOAD_BYTES_LOCAL / 1024 / 1024).toFixed(0)}MB)`);
-} else {
-    console.log('📡 Pakai server resmi Telegram (limit download tetap 20MB)');
-}
+const bot = new TelegramBot(BOT_TOKEN, { polling: true });
 console.log('🤖 Bot jalan (polling mode)...');
 
 // ============================================================
@@ -177,15 +79,10 @@ bot.on('polling_error', (err) => {
 // Daftar command biar muncul di tombol menu "/" Telegram
 bot.setMyCommands([
     { command: 'menu', description: 'Lihat semua perintah' },
-    { command: 'status', description: 'Lihat status dialog update & statistik akun' },
-    { command: 'update', description: 'Lihat info APK update yang lagi aktif' },
-    { command: 'on', description: 'Aktifkan dialog update' },
-    { command: 'off', description: 'Matikan dialog update' },
-    { command: 'accounts', description: 'Lihat daftar akun + terakhir aktif' },
+    { command: 'accounts', description: 'Lihat daftar akun user' },
+    { command: 'lastactive', description: 'Lihat ID user yang terakhir aktif' },
     { command: 'skipboost', description: 'Skip dialog boost 15 detik buat 1 ID' },
     { command: 'unskipboost', description: 'Balikin dialog boost buat 1 ID' },
-    { command: 'boostskiplist', description: 'Lihat daftar ID yang di-skip boost-nya' },
-    { command: 'checkboost', description: 'Cek status skip-boost 1 ID langsung dari database' },
 ]).catch((err) => console.error('Gagal set command list:', err));
 
 function formatId(n) {
@@ -235,18 +132,12 @@ const pendingAction = new Map(); // chatId -> 'skipboost' | 'unskipboost'
 const menuKeyboard = {
     reply_markup: {
         inline_keyboard: [
-            [{ text: '📊 Status', callback_data: 'status' }],
-            [{ text: '🆕 Info Update Terakhir', callback_data: 'update' }],
-            [
-                { text: '✅ Aktifkan Dialog', callback_data: 'on' },
-                { text: '⛔ Matikan Dialog', callback_data: 'off' },
-            ],
             [{ text: '📋 Lihat Daftar Akun', callback_data: 'accounts' }],
+            [{ text: '🕒 Terakhir Aktif', callback_data: 'lastactive' }],
             [
                 { text: '🚀 Skip Boost (ID)', callback_data: 'skipboost' },
                 { text: '↩️ Un-skip Boost (ID)', callback_data: 'unskipboost' },
             ],
-            [{ text: '📋 Daftar ID Skip Boost', callback_data: 'boostskiplist' }],
         ],
     },
 };
@@ -254,10 +145,9 @@ const menuKeyboard = {
 async function sendMenu(chatId) {
     // Ngirim menu baru = user "keluar" dari alur nunggu-balesan manapun.
     pendingAction.delete(chatId);
-    const limitMb = (MAX_BOT_DOWNLOAD_BYTES / 1024 / 1024).toFixed(0);
     await bot.sendMessage(
         chatId,
-        `<b>Panel Admin Blue Games</b>\nPilih menu di bawah, atau kirim file .apk langsung ke sini buat update otomatis (maks ${limitMb}MB).`,
+        `<b>Panel Admin Blue Games</b>\nPilih menu di bawah.`,
         { parse_mode: 'HTML', ...menuKeyboard }
     );
 }
@@ -274,14 +164,8 @@ function parseAccountId(raw) {
 async function runAction(chatId, action, arg) {
     const ref = db.ref();
 
-    if (action === 'status') {
-        const [counterSnap, updateSnap, lastActiveSnap] = await Promise.all([
-            ref.child('counter').once('value'),
-            ref.child('updateStatus').once('value'),
-            ref.child('lastActive').once('value'),
-        ]);
-        const counter = counterSnap.val() || 0;
-        const status = updateSnap.val() || { maintenance: false, updateUrl: '' };
+    if (action === 'lastactive') {
+        const lastActiveSnap = await ref.child('lastActive').once('value');
         const lastActiveMap = lastActiveSnap.val() || {};
 
         const activeEntries = Object.entries(lastActiveMap).map(([id, ts]) => ({
@@ -298,43 +182,11 @@ async function runAction(chatId, action, arg) {
 
         await bot.sendMessage(
             chatId,
-            `<b>Status</b>\n\n` +
-                `Total akun: ${formatId(counter)} (${counter})\n` +
+            `<b>Terakhir Aktif</b>\n\n` +
                 `Aktif 24 jam terakhir: ${active24h} akun\n` +
-                `Paling baru aktif: ${mostRecentLine}\n\n` +
-                `Dialog update: ${status.maintenance ? 'AKTIF' : 'MATI'}\n` +
-                `Link update: ${status.updateUrl || '(belum di-set)'}`,
+                `Paling baru aktif: ${mostRecentLine}`,
             { parse_mode: 'HTML' }
         );
-    } else if (action === 'update') {
-        const updateSnap = await ref.child('updateStatus').once('value');
-        const status = updateSnap.val() || { maintenance: false, updateUrl: '' };
-
-        if (!status.updateUrl) {
-            await bot.sendMessage(chatId, '(belum ada update yang di-set. Kirim file .apk langsung ke chat ini)');
-            return;
-        }
-
-        const sizeLine = status.fileSize ? `${(status.fileSize / 1024 / 1024).toFixed(1)}MB` : '(gak diketahui)';
-        const uploadedLine = status.uploadedAt ? formatRelativeTime(status.uploadedAt) : '(gak diketahui)';
-
-        await bot.sendMessage(
-            chatId,
-            `<b>Update Aktif Sekarang</b>\n\n` +
-                `Nama file: ${status.fileName || '(gak ada nama)'}\n` +
-                `Ukuran: ${sizeLine}\n` +
-                `versionCode: ${status.latestVersionCode || '(gak diketahui)'}\n` +
-                `Diupload: ${uploadedLine}\n` +
-                `Dialog update: ${status.maintenance ? 'AKTIF (bakal ke-download otomatis di app user)' : 'MATI (APK ini nganggur, gak dikirim ke user manapun)'}\n\n` +
-                `Link: ${status.updateUrl}`,
-            { parse_mode: 'HTML' }
-        );
-    } else if (action === 'on') {
-        await ref.child('updateStatus/maintenance').set(true);
-        await bot.sendMessage(chatId, '✅ Dialog update sekarang AKTIF di aplikasi.');
-    } else if (action === 'off') {
-        await ref.child('updateStatus/maintenance').set(false);
-        await bot.sendMessage(chatId, '✅ Dialog update sekarang DIMATIKAN.');
     } else if (action === 'accounts') {
         const [accountsSnap, lastActiveSnap] = await Promise.all([
             ref.child('accounts').once('value'),
@@ -387,223 +239,6 @@ async function runAction(chatId, action, arg) {
         }
         await ref.child(`boostSkip/${id}`).remove();
         await bot.sendMessage(chatId, `✅ Dialog boost dibalikin normal (tampil lagi) buat ID ${formatId(id)}.`);
-    } else if (action === 'boostskiplist') {
-        const skipSnap = await ref.child('boostSkip').once('value');
-        const skipMap = skipSnap.val() || {};
-        const ids = Object.keys(skipMap).filter((k) => skipMap[k] === true);
-        if (ids.length === 0) {
-            await bot.sendMessage(chatId, '(belum ada ID yang di-skip dialog boost-nya)');
-        } else {
-            const lines = ids
-                .map((idStr) => parseInt(idStr, 10))
-                .sort((a, b) => a - b)
-                .map((id) => formatId(id));
-            await bot.sendMessage(chatId, `<b>ID yang Dialog Boost-nya Di-skip</b>\n\n${lines.join('\n')}`, {
-                parse_mode: 'HTML',
-            });
-        }
-    } else if (action === 'checkboost') {
-        if (!arg) {
-            await bot.sendMessage(chatId, 'Kirim: /checkboost <id>\nContoh: /checkboost 1');
-            return;
-        }
-        const id = parseAccountId(arg);
-        if (id === null) {
-            await bot.sendMessage(chatId, '⚠️ ID gak valid, harus angka.');
-            return;
-        }
-        const snap = await ref.child(`boostSkip/${id}`).once('value');
-        const raw = snap.val();
-        await bot.sendMessage(
-            chatId,
-            `Path: boostSkip/${id}\n` +
-                `Nilai di database: ${JSON.stringify(raw)}\n` +
-                `Status: ${raw === true ? '✅ DI-SKIP' : '⛔ TIDAK di-skip (dialog tetap tampil)'}`
-        );
-    }
-}
-
-const DOWNLOAD_DIR = path.join(__dirname, 'downloads');
-if (!fs.existsSync(DOWNLOAD_DIR)) fs.mkdirSync(DOWNLOAD_DIR);
-const APK_PATH = path.join(DOWNLOAD_DIR, 'latest.apk');
-
-// Dipakai kalau LOCAL_API_URL gak aktif (server resmi Telegram) --
-// download lewat HTTPS biasa dari link file resmi Telegram.
-function downloadToFile(url, destPath) {
-    return new Promise((resolve, reject) => {
-        const file = fs.createWriteStream(destPath);
-        https
-            .get(url, (res) => {
-                if (res.statusCode !== 200) {
-                    file.close();
-                    fs.unlink(destPath, () => {});
-                    reject(new Error(`HTTP ${res.statusCode} pas download dari Telegram`));
-                    return;
-                }
-                res.pipe(file);
-                file.on('finish', () => file.close(resolve));
-            })
-            .on('error', (err) => {
-                fs.unlink(destPath, () => {});
-                reject(err);
-            });
-    });
-}
-
-function getPublicBaseUrl() {
-    // Railway otomatis nyediain domain publiknya di env var ini KALAU
-    // "Generate Domain" udah diaktifin di tab Settings > Networking service
-    // ini. PUBLIC_BASE_URL cuma dipakai sebagai fallback manual.
-    if (process.env.RAILWAY_PUBLIC_DOMAIN) return `https://${process.env.RAILWAY_PUBLIC_DOMAIN}`;
-    if (process.env.PUBLIC_BASE_URL) return process.env.PUBLIC_BASE_URL.replace(/\/$/, '');
-    return null;
-}
-
-// Server HTTP kecil buat nyajiin APK yang udah didownload, biar linknya
-// STABIL & GAK KEDALUWARSA -- beda sama link file:// bawaan Telegram yang
-// cuma valid ~1 jam. User bisa buka app-nya kapan aja (bahkan berhari-hari
-// setelah admin kirim APK-nya ke bot), link ini tetap kepake.
-//
-// CATATAN: link ini SENGAJA statis ("/latest.apk") -- filenya yang ditimpa
-// tiap ada update baru, bukan linknya yang berubah. Makanya app di sisi
-// Android JANGAN pake link ini buat nentuin "ada update baru apa enggak"
-// (linknya emang selalu sama) -- app harus bandingin `latestVersionCode`
-// (dibaca otomatis di bawah) sama versionCode yang lagi kepasang.
-const PORT = process.env.PORT || 3000;
-http
-    .createServer((req, res) => {
-        if (req.url === '/latest.apk' && fs.existsSync(APK_PATH)) {
-            res.writeHead(200, {
-                'Content-Type': 'application/vnd.android.package-archive',
-                'Content-Length': fs.statSync(APK_PATH).size,
-            });
-            fs.createReadStream(APK_PATH).pipe(res);
-        } else {
-            res.writeHead(404);
-            res.end('Not found');
-        }
-    })
-    .listen(PORT, () => console.log(`🌐 Static server APK jalan di port ${PORT}`));
-
-// ============================================================
-// BACA versionCode LANGSUNG DARI FILE APK -- admin GAK PERLU KETIK
-// ANGKA APAPUN. Ini yang bikin seluruh alur update jadi 100% otomatis:
-// admin cuma kirim file .apk ke chat, sisanya (hosting + baca versi +
-// tulis ke Firebase) semua kejadian sendiri di sini.
-// ============================================================
-function readApkVersionCode(apkPath) {
-    return new Promise((resolve, reject) => {
-        const parser = new AppInfoParser(apkPath);
-        parser
-            .parse()
-            .then((result) => {
-                // app-info-parser balikin versionCode sebagai string/number
-                // tergantung versi APK -- dipaksa jadi Number biar konsisten
-                // dibandingin sama versionCode di app Android (Long).
-                const versionCode = Number(result.versionCode);
-                if (!versionCode || Number.isNaN(versionCode)) {
-                    reject(new Error('versionCode gak kebaca dari APK (hasil parse kosong/invalid)'));
-                    return;
-                }
-                resolve({ versionCode, versionName: result.versionName || null });
-            })
-            .catch(reject);
-    });
-}
-
-async function handleApkUpload(msg) {
-    const chatId = msg.chat.id;
-    if (!isAuthorized(chatId)) {
-        bot.sendMessage(chatId, `⛔ Kamu gak punya akses. Chat ID kamu: ${chatId}`);
-        return;
-    }
-
-    const doc = msg.document;
-    const fileName = doc.file_name || 'update.apk';
-    if (!fileName.toLowerCase().endsWith('.apk')) {
-        await bot.sendMessage(chatId, '⚠️ File yang dikirim bukan .apk, diabaikan.');
-        return;
-    }
-
-    if (doc.file_size && doc.file_size > MAX_BOT_DOWNLOAD_BYTES) {
-        const limitMb = (MAX_BOT_DOWNLOAD_BYTES / 1024 / 1024).toFixed(0);
-        await bot.sendMessage(
-            chatId,
-            `⚠️ File-nya ${(doc.file_size / 1024 / 1024).toFixed(1)}MB -- di atas limit ${limitMb}MB yang aktif sekarang.\n\n` +
-                (LOCAL_API_URL
-                    ? `Local Bot API Server udah aktif tapi tetep kelebihan -- ukuran ini beneran di luar batas 2GB.`
-                    : `Ini limit dari server RESMI Telegram (bot cuma bisa download balik file <= 20MB, walau kirimnya boleh sampe 50MB). Set env var TELEGRAM_API_ID & TELEGRAM_API_HASH buat naikin limitnya sampe 2GB.`)
-        );
-        return;
-    }
-
-    const publicBase = getPublicBaseUrl();
-    if (!publicBase) {
-        await bot.sendMessage(
-            chatId,
-            '⚠️ Domain publik Railway belum aktif buat service ini. Aktifin dulu di tab Settings > Networking > "Generate Domain", atau set env var PUBLIC_BASE_URL manual -- baru kirim ulang APK-nya.'
-        );
-        return;
-    }
-
-    try {
-        await bot.sendMessage(chatId, `⏳ Mengunduh ${fileName} (${(doc.file_size / 1024 / 1024).toFixed(1)}MB) dari Telegram...`);
-
-        if (LOCAL_API_URL) {
-            // Mode local (satu container dengan telegram-bot-api): file_path
-            // dari getFile udah berupa ABSOLUTE PATH DI DISK CONTAINER INI
-            // SENDIRI -- tinggal di-copy langsung, gak perlu request HTTP lagi
-            // (itu emang gak didukung lagi di mode --local, lihat komentar
-            // panjang di bagian atas file ini).
-            const file = await bot.getFile(doc.file_id);
-            await fs.promises.copyFile(file.file_path, APK_PATH);
-        } else {
-            // Mode server resmi Telegram: file_path masih berupa path relatif
-            // yang perlu diubah jadi link HTTPS buat didownload.
-            const fileLink = await bot.getFileLink(doc.file_id);
-            await downloadToFile(fileLink, APK_PATH);
-        }
-
-        // Baca versionCode langsung dari file APK yang baru kedownload --
-        // GAGAL DI SINI = STOP, jangan lanjut nulis ke Firebase sama sekali.
-        // Lebih aman APK lama tetap aktif daripada nulis data update yang
-        // versionCode-nya gak jelas (bisa bikin app user gak pernah keupdate
-        // ATAU malah gak mau install sama sekali).
-        let versionInfo;
-        try {
-            versionInfo = await readApkVersionCode(APK_PATH);
-        } catch (err) {
-            console.error('Gagal baca versionCode APK:', err);
-            await bot.sendMessage(
-                chatId,
-                `⚠️ File udah kedownload tapi GAGAL baca versionCode-nya (${err.message}).\n` +
-                    `Firebase TIDAK diupdate -- update yang lagi aktif sekarang (kalau ada) tetap dipakai. ` +
-                    `Cek lagi APK-nya, mungkin corrupt atau bukan APK valid.`
-            );
-            return;
-        }
-
-        const publicUrl = `${publicBase}/latest.apk`;
-        await db.ref('updateStatus').set({
-            maintenance: true,
-            updateUrl: publicUrl,
-            latestVersionCode: versionInfo.versionCode,
-            latestVersionName: versionInfo.versionName,
-            fileName,
-            fileSize: doc.file_size || 0,
-            uploadedAt: Date.now(),
-        });
-
-        await bot.sendMessage(
-            chatId,
-            `✅ APK diterima & disimpan di server.\n` +
-                `versionCode terdeteksi: ${versionInfo.versionCode}` +
-                (versionInfo.versionName ? ` (v${versionInfo.versionName})` : '') +
-                `\nDialog update AKTIF, link permanen:\n${publicUrl}`
-        );
-    } catch (err) {
-        console.error(err);
-        await bot.sendMessage(chatId, `⚠️ Gagal proses APK: ${err.message}`);
     }
 }
 
@@ -614,12 +249,6 @@ bot.on('message', async (msg) => {
     // mati) -- diem aja, biar gak ikut bales bareng instance yang baru.
     if (!(await isCurrentInstance())) {
         console.log('⏭️ Instance ini udah gak aktif (ada instance lebih baru), skip pesan.');
-        return;
-    }
-
-    // Kirim file .apk sebagai attachment (bukan command) -> alur khusus.
-    if (msg.document) {
-        await handleApkUpload(msg);
         return;
     }
 
@@ -662,7 +291,7 @@ bot.on('message', async (msg) => {
         const cmd = cmdRaw.toLowerCase().replace('/', '');
         const arg = rest.join(' ').trim();
 
-        const knownCommands = ['status', 'update', 'on', 'off', 'accounts', 'skipboost', 'unskipboost', 'boostskiplist', 'checkboost'];
+        const knownCommands = ['accounts', 'lastactive', 'skipboost', 'unskipboost'];
         if (knownCommands.includes(cmd)) {
             await runAction(chatId, cmd, arg);
         } else {
@@ -701,4 +330,4 @@ bot.on('callback_query', async (query) => {
         await bot.answerCallbackQuery(query.id, { text: 'Error, cek log Railway.', show_alert: true });
     }
 });
-     
+
